@@ -143,19 +143,80 @@ impl Function {
 #[derive(Debug, Clone)]
 pub struct JsRuntime {
     dom_root: Option<Rc<RefCell<DomNode>>>,
+    dom_modified: bool,
+    url: String,
     pub global_variables: HashMap<String, Option<RuntimeValue>>,
     pub functions: Vec<Function>,
     pub env: Rc<RefCell<Environment>>,
 }
 
 impl JsRuntime {
-    pub fn new(dom_root: Rc<RefCell<DomNode>>) -> Self {
+    pub fn new(dom_root: Rc<RefCell<DomNode>>, url: String) -> Self {
         Self {
             dom_root: Some(dom_root),
+            dom_modified: false,
+            url,
             global_variables: HashMap::new(),
             functions: Vec::new(),
             env: Rc::new(RefCell::new(Environment::new(None))),
         }
+    }
+
+    pub fn dom_modified(&self) -> bool {
+        self.dom_modified
+    }
+
+    /// https://developer.mozilla.org/en-US/docs/Web/API
+    ///
+    /// returns a tuple (bool, Option<RuntimeValue>)
+    ///   bool: whether or not a Web API is found
+    ///   Option<RuntimeValue>: the result of a Web API
+    fn call_web_api(
+        &mut self,
+        func: &RuntimeValue,
+        arguments: &Vec<Option<Rc<Node>>>,
+        env: Rc<RefCell<Environment>>,
+    ) -> (bool, Option<RuntimeValue>) {
+        if func == &RuntimeValue::StringLiteral("console.log".to_string()) {
+            match self.eval(&arguments[0], env.clone()) {
+                Some(arg) => {
+                    println!("[console.log] {:?}", arg.to_string());
+                    return (true, None);
+                }
+                None => return (false, None),
+            }
+        }
+
+        if func == &RuntimeValue::StringLiteral("document.getElementById".to_string()) {
+            let arg = match self.eval(&arguments[0], env.clone()) {
+                Some(a) => a,
+                None => return (true, None),
+            };
+            let target = match get_element_by_id(self.dom_root.clone(), &arg.to_string()) {
+                Some(n) => n,
+                None => return (true, None),
+            };
+            println!(
+                "[document.getElementById] {:?}\n{:?}",
+                arg.to_string(),
+                target
+            );
+            return (
+                true,
+                Some(RuntimeValue::HtmlElement {
+                    object: target,
+                    property: None,
+                }),
+            );
+        }
+
+        /*
+        if func == &RuntimeValue::StringLiteral("setTimeout".to_string()) {
+            return (true, None);
+        }
+        */
+
+        (false, None)
     }
 
     fn eval(
@@ -262,9 +323,8 @@ impl JsRuntime {
 
                     match left_value {
                         RuntimeValue::Number(n) => panic!("unexpected value {:?}", n),
-                        RuntimeValue::StringLiteral(s) => {
-                            // TODO: update variable
-                            println!("@@@@@@@@@@@@@@ assignment to string s {:?}", s);
+                        RuntimeValue::StringLiteral(_s) => {
+                            // TODO: update variable here
                         }
                         RuntimeValue::HtmlElement { object, property } => {
                             if let Some(p) = property {
@@ -272,6 +332,7 @@ impl JsRuntime {
                                 // `document.getElementById("target").innerHTML = "foobar";`
                                 // Currently, an assignment value should be a text like "foobar".
                                 if p == "innerHTML" {
+                                    self.dom_modified = true;
                                     object.borrow_mut().update_first_child(Some(Rc::new(
                                         RefCell::new(DomNode::new(DomNodeKind::Text(
                                             right_value.to_string(),
@@ -308,11 +369,38 @@ impl JsRuntime {
                     }
                     _ => {
                         if object_value == RuntimeValue::StringLiteral("document".to_string()) {
+                            // TOOD: this is tricky to support member functions for document.*. find smarter way...
+                            if property_value
+                                == RuntimeValue::StringLiteral("getElementById".to_string())
+                            {
+                                return Some(
+                                    object_value
+                                        + RuntimeValue::StringLiteral(".".to_string())
+                                        + property_value,
+                                );
+                            }
+
                             // set `property` to the HtmlElement value.
                             return Some(RuntimeValue::HtmlElement {
                                 object: self.dom_root.clone().expect("failed to get root node"),
                                 property: Some(property_value.to_string()),
                             });
+                        }
+
+                        if object_value == RuntimeValue::StringLiteral("location".to_string()) {
+                            if property_value == RuntimeValue::StringLiteral("href".to_string()) {
+                                println!("[location.href] {:?}", self.url);
+                                return Some(RuntimeValue::StringLiteral(self.url.clone()));
+                            }
+
+                            if property_value == RuntimeValue::StringLiteral("hash".to_string()) {
+                                let hash = match self.url.find("#") {
+                                    Some(i) => self.url[i..].to_string(),
+                                    None => "".to_string(),
+                                };
+                                println!("[location.hash] {:?}", hash);
+                                return Some(RuntimeValue::StringLiteral(hash.clone()));
+                            }
                         }
 
                         // return a concatenated string such as "console.log"
@@ -331,16 +419,13 @@ impl JsRuntime {
                     None => return None,
                 };
 
-                // call an embedded function
-                if callee_value == RuntimeValue::StringLiteral("console.log".to_string()) {
-                    match self.eval(&arguments[0], env.clone()) {
-                        Some(arg) => {
-                            println!("[console.log] {:?}", arg.to_string());
-                        }
-                        None => return None,
-                    }
-                    return None;
+                // call a Web API
+                let web_api_result = self.call_web_api(&callee_value, arguments, env.clone());
+                if web_api_result.0 {
+                    return web_api_result.1;
                 }
+
+                /*
                 if callee_value
                     == RuntimeValue::StringLiteral("document.getElementById".to_string())
                 {
@@ -362,12 +447,14 @@ impl JsRuntime {
                         property: None,
                     });
                 }
+                */
 
                 let mut new_local_variables: VariableMap = VariableMap::new();
 
-                // find a function
+                // find a function defined in the JS code
                 let function = {
                     let mut f: Option<Function> = None;
+
                     for func in &self.functions {
                         if callee_value == RuntimeValue::StringLiteral(func.id.to_string()) {
                             f = Some(func.clone());
